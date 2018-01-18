@@ -1,7 +1,13 @@
+--------------------------------------------------------------------------------
+
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
+--------------------------------------------------------------------------------
+
 module Main where
+
+--------------------------------------------------------------------------------
 
 import qualified Control.Lens              as Lens
 
@@ -40,11 +46,14 @@ import           Data.Aeson                as Aeson
 import           Data.Maybe
 import           Data.Monoid
 
+import           Control.Exception         (assert)
+
 import           System.Exit               (ExitCode (ExitFailure, ExitSuccess))
 
--- Send PING every 5 minute
--- If we don't receive a PONG within 10 seconds, we should reconnect
--- LISTEN
+import           TwitchOSD.Scope           (Scope)
+import qualified TwitchOSD.Scope           as Scope
+
+--------------------------------------------------------------------------------
 
 gpgDecrypt :: FP.FilePath -> IO ByteString
 gpgDecrypt path = do
@@ -58,6 +67,8 @@ gpgDecrypt path = do
                         , "It produced the following text on stderr:\n"
                         , Text.unpack stderr
                         ] |> mconcat |> fail
+
+--------------------------------------------------------------------------------
 
 data APIKey
   = APIKey
@@ -80,12 +91,14 @@ getAPIKey = do
   Aeson.decodeStrict stdout
     |> maybe (fail "Failed to decode JSON in api-key.gpg") pure
 
+--------------------------------------------------------------------------------
+
 data AppAccessToken
   = AppAccessToken
     { appAccessTokenAccessToken  :: !Text
     , appAccessTokenRefreshToken :: !Text
     , appAccessTokenExpiresIn    :: !Int
-    , appAccessTokenScope        :: ![Text]
+    , appAccessTokenScopes       :: ![Scope]
     }
   deriving ()
 
@@ -94,41 +107,29 @@ instance FromJSON AppAccessToken where
     appAccessTokenAccessToken  <- o .: "access_token"
     appAccessTokenRefreshToken <- o .: "refresh_token"
     appAccessTokenExpiresIn    <- o .: "expires_in"
-    appAccessTokenScope        <- o .: "scope"
+    appAccessTokenScopes       <- o .: "scope"
     pure (AppAccessToken {..})
 
--- POST https://api.twitch.tv/kraken/oauth2/token
---          ?client_id=...
---          &client_secret=...
---          &grant_type=client_credentials
-
-twitchAuthenticate :: APIKey -> IO AppAccessToken
-twitchAuthenticate apiKey = do
+twitchAuthenticate :: APIKey -> [Scope] -> IO AppAccessToken
+twitchAuthenticate apiKey scopes = do
+  let scopeText = Text.intercalate " " (map Scope.scopeToText scopes)
   let opts = Wreq.defaults
              |> Lens.set (Wreq.param "client_id")     [apiKeyClientID apiKey]
              |> Lens.set (Wreq.param "client_secret") [apiKeySecret apiKey]
              |> Lens.set (Wreq.param "grant_type")    ["client_credentials"]
-  let body = "" :: Text
-  -- r <- Wreq.postWith opts "https://api.twitch.tv/kraken/oauth2/token" body
-  pure _
+             |> Lens.set (Wreq.param "scope")         [scopeText]
+  let body = "" :: ByteString
+  r <- Wreq.postWith opts "https://api.twitch.tv/kraken/oauth2/token" body
+  result <- Aeson.decode (Lens.view Wreq.responseBody r)
+            |> maybe (fail "Failed to decode response JSON") pure
+  assert (appAccessTokenScopes result == scopes) (pure result)
 
-ws :: APIKey -> WS.Connection -> IO ()
-ws apiKey connection = do
-  putStrLn "Connected!"
-
-  void $ forkIO $ forever $ do
-    message <- WS.receiveData connection
-    print (message :: Text)
-
-  whileM $ do
-    line <- getLine
-    unless (null line) $ do
-      WS.sendTextData connection (Text.pack line)
-    pure (not (null line))
-
-  WS.sendClose connection (Text.pack "Bye!")
+--------------------------------------------------------------------------------
 
 main :: IO ()
 main = do
   apiKey <- getAPIKey
-  WSS.runSecureClient "pubsub-edge.twitch.tv" 443 "/" (ws apiKey)
+  appAccessToken <- twitchAuthenticate apiKey [] -- FIXME: pick scopes
+  undefined
+
+--------------------------------------------------------------------------------
